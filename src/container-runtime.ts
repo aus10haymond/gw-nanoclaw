@@ -3,6 +3,7 @@
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
 import { execSync } from 'child_process';
+import fs from 'fs';
 import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
@@ -10,6 +11,41 @@ import { log } from './log.js';
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
+
+/** Hostname containers use to reach the host machine. */
+export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+
+/**
+ * Address the credential proxy binds to. Containers always reach it via
+ * `host.docker.internal` (see {@link hostGatewayArgs}); this controls which
+ * host-side interface accepts those connections.
+ *
+ * Docker Desktop (macOS) / WSL2: 127.0.0.1 — the VM routes
+ *   host.docker.internal to loopback.
+ * Bare-metal Linux (e.g. the GX10 deployment target): bind to the docker0
+ *   bridge IP so only containers can reach it. A proxy on 127.0.0.1 would be
+ *   unreachable here, since host.docker.internal resolves to the bridge
+ *   gateway IP, not loopback. Falls back to 0.0.0.0 if docker0 isn't found.
+ *
+ * Override with CREDENTIAL_PROXY_HOST (e.g. rootless Docker, custom bridge).
+ */
+export const PROXY_BIND_HOST = process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
+
+function detectProxyBindHost(): string {
+  if (os.platform() === 'darwin') return '127.0.0.1';
+
+  // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
+  // Check /proc, not env vars — WSL_DISTRO_NAME isn't set under systemd.
+  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
+
+  // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
+  const docker0 = os.networkInterfaces()['docker0'];
+  if (docker0) {
+    const ipv4 = docker0.find((a) => a.family === 'IPv4');
+    if (ipv4) return ipv4.address;
+  }
+  return '0.0.0.0';
+}
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {

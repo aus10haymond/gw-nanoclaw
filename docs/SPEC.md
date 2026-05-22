@@ -381,7 +381,7 @@ Additional mounts appear at `/workspace/extra/{containerPath}` inside the contai
 
 ### Claude Authentication
 
-Configure authentication in a `.env` file in the project root. Two options:
+Configure authentication in a `.env` file in the project root. Three options:
 
 **Option 1: Claude Subscription (OAuth token)**
 ```bash
@@ -393,6 +393,16 @@ The token can be extracted from `~/.claude/.credentials.json` if you're logged i
 ```bash
 ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
+
+**Option 3: Google Vertex AI**
+```bash
+CLAUDE_CODE_USE_VERTEX=1
+CLOUD_ML_REGION=your-gcp-region
+ANTHROPIC_VERTEX_PROJECT_ID=your-gcp-project-id
+```
+Requires a GCP credentials file at `~/.config/gcloud/application_default_credentials.json` (created by `gcloud auth application-default login`). To use a different credentials file path, add `GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json`. Do not set `ANTHROPIC_MODEL`.
+
+Vertex mode is handled by NanoClaw's built-in credential proxy rather than OneCLI: the host obtains Google OAuth2 tokens from Application Default Credentials and forwards to the Vertex AI endpoint, while the container gets `CLAUDE_CODE_SKIP_VERTEX_AUTH=1` so the SDK skips Google auth internally. Real credentials never enter containers — see [SECURITY.md](SECURITY.md).
 
 Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`) are extracted from `.env` and written to `data/env/env`, then mounted into the container at `/workspace/env-dir/env` and sourced by the entrypoint script. This ensures other environment variables in `.env` are not exposed to the agent. This workaround is needed because some container runtimes lose `-e` environment variables when using `-i` (interactive mode with piped stdin).
 

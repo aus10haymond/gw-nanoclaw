@@ -68,7 +68,7 @@ Messages and task operations are verified against group identity:
 
 Real API credentials **never enter containers**. NanoClaw uses [OneCLI's Agent Vault](https://github.com/onecli/onecli) to proxy outbound requests and inject credentials at the gateway level.
 
-**How it works:**
+**How it works (API key / OAuth):**
 1. Credentials are registered once with `onecli secrets create`, stored and managed by OneCLI
 2. When NanoClaw spawns a container, it calls `applyContainerConfig()` to route outbound HTTPS through the OneCLI gateway
 3. The gateway matches requests by host and path, injects the real credential, and forwards
@@ -77,9 +77,19 @@ Real API credentials **never enter containers**. NanoClaw uses [OneCLI's Agent V
 **Per-agent policies:**
 Each NanoClaw group gets its own OneCLI agent identity. This allows different credential policies per group (e.g. your sales agent vs. support agent). OneCLI supports rate limits, and time-bound access and approval flows are on the roadmap.
 
+**How it works (Vertex AI):**
+OneCLI doesn't support Vertex, so Vertex mode uses NanoClaw's built-in credential proxy (`src/credential-proxy.ts`) instead of the gateway.
+1. Containers receive `ANTHROPIC_VERTEX_BASE_URL=http://host.docker.internal:<port>` and `CLAUDE_CODE_SKIP_VERTEX_AUTH=1`
+2. The SDK sends Vertex AI requests to the proxy with no real Google auth
+3. The proxy obtains Google OAuth2 tokens using host-side Application Default Credentials, injects `Authorization: Bearer <token>`, and forwards to `{region}-aiplatform.googleapis.com`
+4. GCP credentials never enter the container — no mounted `.gcloud` directory, no credentials file, no service account keys
+
+On bare-metal Linux (e.g. the GX10 deployment target) the proxy binds to the `docker0` bridge IP so only containers can reach it; on Docker Desktop / WSL2 it binds to loopback. Override with `CREDENTIAL_PROXY_HOST`.
+
 **NOT Mounted:**
 - Channel auth sessions (`store/auth/`) — host only
 - Mount allowlist — external, never mounted
+- GCP credentials directory (`.gcloud`) — never mounted; the proxy injects tokens host-side
 - Any credentials matching blocked patterns
 - `.env` is shadowed with `/dev/null` in the project root mount
 

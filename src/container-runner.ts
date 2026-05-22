@@ -13,6 +13,7 @@ import {
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
+  CREDENTIAL_PROXY_PORT,
   DATA_DIR,
   GROUPS_DIR,
   ONECLI_API_KEY,
@@ -22,7 +23,14 @@ import {
 import { materializeContainerJson } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import {
+  CONTAINER_HOST_GATEWAY,
+  CONTAINER_RUNTIME_BIN,
+  hostGatewayArgs,
+  readonlyMountArgs,
+  stopContainer,
+} from './container-runtime.js';
+import { detectAuthMode, readVertexConfig } from './credential-proxy.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -48,6 +56,12 @@ import {
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
+
+// Auth mode is fixed at startup — it can't change without a restart.
+// Vertex AI uses the built-in credential proxy (OneCLI doesn't support Vertex);
+// API key / OAuth keep using the OneCLI gateway.
+const AUTH_MODE = detectAuthMode();
+const VERTEX_CONFIG = AUTH_MODE === 'vertex' ? readVertexConfig() : null;
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
@@ -418,19 +432,38 @@ async function buildContainerArgs(
     }
   }
 
-  // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
-  // are routed through the agent vault for credential injection. Treated as
-  // a transient hard failure: if we can't wire the gateway, we don't spawn.
-  // The caller (router or host-sweep) catches the throw, leaves the inbound
-  // message pending, and the next sweep tick retries.
-  if (agentIdentifier) {
-    await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+  if (AUTH_MODE === 'vertex') {
+    // Vertex AI: route the SDK's Vertex client through the built-in credential
+    // proxy (started in index.ts). The proxy holds the GCP credentials and
+    // injects a Google OAuth2 Bearer token host-side, so no GCP creds ever
+    // enter the container. OneCLI doesn't support Vertex, so it's bypassed.
+    if (!VERTEX_CONFIG) {
+      throw new Error('Vertex AI mode requires CLOUD_ML_REGION and ANTHROPIC_VERTEX_PROJECT_ID in .env');
+    }
+    const proxyUrl = `http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`;
+    args.push('-e', 'CLAUDE_CODE_USE_VERTEX=1');
+    args.push('-e', `CLOUD_ML_REGION=${VERTEX_CONFIG.region}`);
+    args.push('-e', `ANTHROPIC_VERTEX_PROJECT_ID=${VERTEX_CONFIG.projectId}`);
+    // Point the SDK's Vertex client at our proxy instead of the real endpoint
+    args.push('-e', `ANTHROPIC_VERTEX_BASE_URL=${proxyUrl}`);
+    // Skip Google auth inside the container — the proxy handles it
+    args.push('-e', 'CLAUDE_CODE_SKIP_VERTEX_AUTH=1');
+    log.info('Vertex AI credential proxy wired', { containerName, region: VERTEX_CONFIG.region });
+  } else {
+    // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
+    // are routed through the agent vault for credential injection. Treated as
+    // a transient hard failure: if we can't wire the gateway, we don't spawn.
+    // The caller (router or host-sweep) catches the throw, leaves the inbound
+    // message pending, and the next sweep tick retries.
+    if (agentIdentifier) {
+      await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+    }
+    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+    if (!onecliApplied) {
+      throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
+    }
+    log.info('OneCLI gateway applied', { containerName });
   }
-  const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
-  if (!onecliApplied) {
-    throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
-  }
-  log.info('OneCLI gateway applied', { containerName });
 
   // Host gateway
   args.push(...hostGatewayArgs());
