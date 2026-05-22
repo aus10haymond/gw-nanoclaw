@@ -31,6 +31,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode, readVertexConfig } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -441,14 +442,37 @@ async function buildContainerArgs(
       throw new Error('Vertex AI mode requires CLOUD_ML_REGION and ANTHROPIC_VERTEX_PROJECT_ID in .env');
     }
     const proxyUrl = `http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`;
-    args.push('-e', 'CLAUDE_CODE_USE_VERTEX=1');
-    args.push('-e', `CLOUD_ML_REGION=${VERTEX_CONFIG.region}`);
-    args.push('-e', `ANTHROPIC_VERTEX_PROJECT_ID=${VERTEX_CONFIG.projectId}`);
-    // Point the SDK's Vertex client at our proxy instead of the real endpoint
-    args.push('-e', `ANTHROPIC_VERTEX_BASE_URL=${proxyUrl}`);
-    // Skip Google auth inside the container — the proxy handles it
-    args.push('-e', 'CLAUDE_CODE_SKIP_VERTEX_AUTH=1');
-    log.info('Vertex AI credential proxy wired', { containerName, region: VERTEX_CONFIG.region });
+    if (provider === 'opencode') {
+      // OpenCode reaches Gemini via Vertex's OpenAI-compatible endpoint, routed
+      // through the credential proxy. The proxy injects the GCP Bearer token and
+      // prepends /v1; OpenCode's openai client appends /chat/completions. So the
+      // base URL carries the Vertex OpenAI path and no GCP creds enter the
+      // container. Final URL: <region>-aiplatform.googleapis.com/v1/projects/
+      // <id>/locations/<region>/endpoints/openapi/chat/completions.
+      const openapiBase =
+        `${proxyUrl}/projects/${VERTEX_CONFIG.projectId}` + `/locations/${VERTEX_CONFIG.region}/endpoints/openapi`;
+      args.push('-e', `ANTHROPIC_BASE_URL=${openapiBase}`);
+      // OPENCODE_* provider/model config lives in .env; the host process does
+      // not load .env into process.env, so read it explicitly here (the host
+      // OpenCode provider's process.env passthrough finds nothing).
+      const oc = readEnvFile(['OPENCODE_PROVIDER', 'OPENCODE_MODEL', 'OPENCODE_SMALL_MODEL']);
+      for (const key of ['OPENCODE_PROVIDER', 'OPENCODE_MODEL', 'OPENCODE_SMALL_MODEL'] as const) {
+        if (oc[key]) args.push('-e', `${key}=${oc[key]}`);
+      }
+      log.info('Vertex AI credential proxy wired (OpenCode/OpenAI-compat)', {
+        containerName,
+        region: VERTEX_CONFIG.region,
+      });
+    } else {
+      args.push('-e', 'CLAUDE_CODE_USE_VERTEX=1');
+      args.push('-e', `CLOUD_ML_REGION=${VERTEX_CONFIG.region}`);
+      args.push('-e', `ANTHROPIC_VERTEX_PROJECT_ID=${VERTEX_CONFIG.projectId}`);
+      // Point the SDK's Vertex client at our proxy instead of the real endpoint
+      args.push('-e', `ANTHROPIC_VERTEX_BASE_URL=${proxyUrl}`);
+      // Skip Google auth inside the container — the proxy handles it
+      args.push('-e', 'CLAUDE_CODE_SKIP_VERTEX_AUTH=1');
+      log.info('Vertex AI credential proxy wired', { containerName, region: VERTEX_CONFIG.region });
+    }
   } else {
     // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
     // are routed through the agent vault for credential injection. Treated as

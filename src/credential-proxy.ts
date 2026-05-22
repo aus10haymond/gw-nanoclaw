@@ -53,6 +53,95 @@ async function getGoogleAccessToken(credentialsPath?: string): Promise<string> {
   return token;
 }
 
+// Keywords Gemini's function-declaration schema rejects. Vertex's OpenAI-compatible
+// endpoint validates tool parameter schemas against a restricted OpenAPI subset and
+// returns INVALID_ARGUMENT on these. $ref/ref/$defs are dropped (Gemini has no schema
+// references); oneOf is rewritten to anyOf (which Gemini does support).
+const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
+  '$schema',
+  '$id',
+  '$ref',
+  'ref',
+  '$defs',
+  'definitions',
+  'additionalProperties',
+  'allOf',
+  'not',
+  'const',
+  'examples',
+  'default',
+  'format',
+  'pattern',
+  'multipleOf',
+  'uniqueItems',
+  'minLength',
+  'maxLength',
+  'minimum',
+  'maximum',
+  'title',
+]);
+
+// Schema-aware prune. Must distinguish JSON-Schema *keywords* (which may be
+// unsupported) from *property names* (arbitrary, e.g. a tool with a property
+// literally named "pattern" or "format") — so we only strip keywords at the
+// schema level and recurse into subschema-bearing keywords, never into property
+// names. (Treating property names as keywords was deleting real properties and
+// leaving dangling `required` entries, which Gemini also rejects.)
+function pruneSchemaForGemini(schema: unknown): void {
+  if (Array.isArray(schema)) {
+    for (const item of schema) pruneSchemaForGemini(item);
+    return;
+  }
+  if (!schema || typeof schema !== 'object') return;
+  const obj = schema as Record<string, unknown>;
+
+  if ('oneOf' in obj && !('anyOf' in obj)) {
+    obj.anyOf = obj.oneOf;
+    delete obj.oneOf;
+  }
+  for (const key of GEMINI_UNSUPPORTED_SCHEMA_KEYS) {
+    if (key in obj) delete obj[key];
+  }
+
+  // Recurse only into keywords whose values are subschemas.
+  const props = obj.properties;
+  if (props && typeof props === 'object') {
+    for (const sub of Object.values(props as Record<string, unknown>)) pruneSchemaForGemini(sub);
+  }
+  if (obj.items) pruneSchemaForGemini(obj.items);
+  for (const kw of ['anyOf', 'prefixItems'] as const) {
+    if (Array.isArray(obj[kw])) for (const sub of obj[kw] as unknown[]) pruneSchemaForGemini(sub);
+  }
+
+  // Safety net: drop `required` entries that have no matching property, which
+  // Gemini rejects (can arise from upstream schemas or earlier transforms).
+  if (Array.isArray(obj.required) && props && typeof props === 'object') {
+    const known = new Set(Object.keys(props as Record<string, unknown>));
+    obj.required = (obj.required as unknown[]).filter((r) => typeof r === 'string' && known.has(r));
+  }
+}
+
+/**
+ * Sanitize OpenAI chat/completions tool parameter schemas so Vertex's Gemini
+ * OpenAI-compatible endpoint accepts them. OpenCode (via the AI SDK) emits rich
+ * JSON-Schema (e.g. $schema, additionalProperties, oneOf, format) that Gemini
+ * rejects. Returns the body unchanged if it isn't JSON or carries no tools, so
+ * non-tool requests pass through untouched.
+ */
+function sanitizeGeminiToolSchemas(body: Buffer): Buffer {
+  let parsed: { tools?: Array<{ function?: { parameters?: unknown } }> };
+  try {
+    parsed = JSON.parse(body.toString('utf8'));
+  } catch {
+    return body;
+  }
+  if (!parsed || !Array.isArray(parsed.tools)) return body;
+  for (const tool of parsed.tools) {
+    if (tool?.function?.parameters) pruneSchemaForGemini(tool.function.parameters);
+  }
+  return Buffer.from(JSON.stringify(parsed), 'utf8');
+}
+
 export function startCredentialProxy(port: number, host = '127.0.0.1'): Promise<Server> {
   const secrets = readEnvFile([
     'ANTHROPIC_API_KEY',
@@ -92,10 +181,17 @@ export function startCredentialProxy(port: number, host = '127.0.0.1'): Promise<
       req.on('data', (c) => chunks.push(c));
       req.on('end', async () => {
         const body = Buffer.concat(chunks);
+        // Vertex's Gemini OpenAI-compatible endpoint rejects unsupported tool-schema
+        // keywords; sanitize chat/completions bodies in Vertex mode. Other requests
+        // (Claude path, non-tool calls) pass through unchanged.
+        const fwdBody =
+          authMode === 'vertex' && (req.url || '').includes('/chat/completions')
+            ? sanitizeGeminiToolSchemas(body)
+            : body;
         const headers: Record<string, string | number | string[] | undefined> = {
           ...(req.headers as Record<string, string>),
           host: upstreamUrl.host,
-          'content-length': body.length,
+          'content-length': fwdBody.length,
         };
 
         // Strip hop-by-hop headers that must not be forwarded by proxies
@@ -157,7 +253,7 @@ export function startCredentialProxy(port: number, host = '127.0.0.1'): Promise<
           }
         });
 
-        upstream.write(body);
+        upstream.write(fwdBody);
         upstream.end();
       });
     });

@@ -34,17 +34,50 @@ export const PROXY_BIND_HOST = process.env.CREDENTIAL_PROXY_HOST || detectProxyB
 function detectProxyBindHost(): string {
   if (os.platform() === 'darwin') return '127.0.0.1';
 
-  // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
-  // Check /proc, not env vars — WSL_DISTRO_NAME isn't set under systemd.
-  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
+  // Native Docker has a docker0 bridge netdev. It's the reliable signal and
+  // takes precedence over WSL detection: native docker-ce inside WSL2 has a
+  // docker0 bridge and behaves like bare-metal Linux (the GX10 target), NOT
+  // like Docker Desktop. Containers reach the host via host.docker.internal →
+  // the bridge gateway (see hostGatewayArgs's --add-host=host-gateway), so the
+  // proxy must bind to the bridge IP — a loopback bind would be unreachable.
+  //
+  // Use /sys (the netdev persists even when the bridge is DOWN, i.e. when no
+  // containers are attached) plus `ip addr` for the address. os.networkInterfaces()
+  // is NOT reliable here — it omits DOWN interfaces, and docker0 is down at host
+  // startup before the first container spawns.
+  if (fs.existsSync('/sys/class/net/docker0')) {
+    const ip = bridgeIpV4('docker0');
+    if (ip) return ip;
+    // Bridge exists but its IP couldn't be read — bind all interfaces so
+    // containers can still reach the proxy via the gateway.
+    return '0.0.0.0';
+  }
 
-  // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
-  const docker0 = os.networkInterfaces()['docker0'];
-  if (docker0) {
-    const ipv4 = docker0.find((a) => a.family === 'IPv4');
-    if (ipv4) return ipv4.address;
+  // No docker0 netdev — Docker Desktop (macOS/Windows/WSL2) runs the engine in
+  // its own VM and routes host.docker.internal to loopback. Check /proc, not
+  // env vars — WSL_DISTRO_NAME isn't set under systemd.
+  if (os.platform() === 'win32' || fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) {
+    return '127.0.0.1';
   }
   return '0.0.0.0';
+}
+
+/**
+ * IPv4 address of a bridge interface, read in a way that works even when the
+ * interface is DOWN. `os.networkInterfaces()` only reports UP interfaces, so
+ * prefer `ip addr` (reports the configured address regardless of state) and
+ * fall back to os.networkInterfaces() if the `ip` tool isn't present.
+ */
+function bridgeIpV4(iface: string): string | null {
+  try {
+    const out = execSync(`ip -4 -o addr show ${iface}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+    const m = out.match(/inet (\d+\.\d+\.\d+\.\d+)\//);
+    if (m) return m[1];
+  } catch {
+    /* `ip` not available — fall through */
+  }
+  const entries = os.networkInterfaces()[iface];
+  return entries?.find((a) => a.family === 'IPv4')?.address ?? null;
 }
 
 /** CLI args needed for the container to resolve the host gateway. */
