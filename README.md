@@ -56,6 +56,82 @@ See [docs/v1-to-v2-changes.md](docs/v1-to-v2-changes.md) for what's different an
 
 </details>
 
+## Vertex AI (Gemini) Backend
+
+> **Fork-specific (Gentle Weapons internal tool).** This fork adds first-class support for running agents on **Google Gemini via Vertex AI**, so the pipeline can use Claude models on a Max subscription for development while codegen agents run on Gemini through a GCP project. Upstream nanoclaw does not include this.
+
+The agent runtime (Claude Code) only speaks the Anthropic API, so Gemini runs through the **OpenCode** provider, pointed at Vertex's OpenAI-compatible endpoint. All Vertex traffic is mediated by NanoClaw's built-in **credential proxy**: it injects a GCP OAuth2 token host-side and sanitizes tool schemas for Gemini, so **no GCP credentials ever enter the container**. OneCLI is bypassed in this mode (it doesn't support Vertex).
+
+### Prerequisites
+
+- A GCP project with the **Vertex AI API enabled** and access to Gemini models (an IAM principal with **`roles/aiplatform.user`**).
+- Docker, Node 20+/pnpm 10+ (standard nanoclaw requirements).
+
+### Setup
+
+**1. Authenticate with Application Default Credentials (ADC).** The proxy reads ADC host-side; credentials are never exported into the shell or the container.
+
+- *Local / dev:* `gcloud auth application-default login` — writes `~/.config/gcloud/application_default_credentials.json`. Uses your personal identity; fine for testing.
+- *Internal / production (recommended):* create a service account with `roles/aiplatform.user`, download a JSON key **outside the repo** (`chmod 600`), and point `GOOGLE_APPLICATION_CREDENTIALS` at it in `.env` (below). Pipeline-scoped, non-personal, portable to bare-metal hosts.
+
+> **Credential isolation:** keep all GCP env vars in `nanoclaw-v2/.env` (read explicitly via `readEnvFile`, never loaded into `process.env`). Never put them in your shell profile — a Claude Code session authenticated with a Max subscription must not inherit pipeline GCP credentials.
+
+**2. Install the OpenCode provider** (one-time):
+
+```bash
+# In this fork the providers branch lives on the `upstream` remote:
+git fetch upstream providers
+claude    # then run: /add-opencode
+```
+
+`/add-opencode` copies the provider files, pins `@opencode-ai/sdk` + `opencode-ai` to `1.4.17`, and is idempotent.
+
+**3. Configure `.env`** in the project root (keep comments on their own lines — a `#` inside a value is kept verbatim):
+
+```bash
+# Puts the credential proxy in Vertex/Bearer-inject mode (host-side only).
+CLAUDE_CODE_USE_VERTEX=1
+CLOUD_ML_REGION=global
+ANTHROPIC_VERTEX_PROJECT_ID=your-gcp-project-id
+
+# OpenCode -> Vertex's OpenAI-compatible endpoint (Chat Completions API).
+OPENCODE_PROVIDER=vertex-openai
+OPENCODE_MODEL=vertex-openai/google/gemini-2.5-flash
+
+# Only if NOT using `gcloud auth application-default login`:
+# GOOGLE_APPLICATION_CREDENTIALS=/abs/path/to/service-account.json
+```
+
+**4. Build the agent image:**
+
+```bash
+./container/build.sh
+```
+
+**5. Point an agent group at OpenCode** (per-group; other groups can stay on Claude):
+
+```bash
+ncl groups config update --id <agent-group-id> --provider opencode
+```
+
+**6. Restart and test:**
+
+```bash
+systemctl --user restart nanoclaw-v2-<install-id>      # Linux/WSL2
+pnpm run chat "what model and provider are you running on?"
+# -> "I am running on the google/gemini-2.5-flash model, provided by Vertex AI."
+```
+
+### How it works
+
+`OPENCODE_PROVIDER=vertex-openai` selects the `@ai-sdk/openai-compatible` SDK (Chat Completions API — the default `openai` provider uses the Responses API, which Vertex rejects for first-party Gemini). OpenCode points at the proxy's base URL `…/projects/<id>/locations/<region>/endpoints/openapi`; the proxy injects `Authorization: Bearer <gcp-token>`, prepends `/v1`, sanitizes tool parameter schemas to Gemini's restricted OpenAPI subset, and forwards to `https://aiplatform.googleapis.com/v1/.../chat/completions`.
+
+### Troubleshooting
+
+- **`OpenMaaS model … not supported`** — the request is hitting the Responses API. Confirm `OPENCODE_PROVIDER=vertex-openai` (not `openai`).
+- **`INVALID_ARGUMENT`** — a tool schema reached Gemini with unsupported keywords; the proxy's `sanitizeGeminiToolSchemas` handles this. After changing `OPENCODE_MODEL`/`OPENCODE_PROVIDER`, wipe stale OpenCode session state: `rm -rf data/v2-sessions/<group>/<session>/opencode-xdg/*` and `delete from session_state` in that session's `outbound.db`.
+- **`Cannot connect to API`** — the container can't reach the proxy. The proxy must bind to the docker0 bridge IP on native Docker (incl. native docker-ce inside WSL2); detection is automatic, override with `CREDENTIAL_PROXY_HOST` in `.env` if needed.
+
 ## Philosophy
 
 **Small enough to understand.** One process, a few source files and no microservices. If you want to understand the full NanoClaw codebase, just ask Claude Code to walk you through it.
@@ -80,7 +156,8 @@ See [docs/v1-to-v2-changes.md](docs/v1-to-v2-changes.md) for what's different an
 - **Scheduled tasks** — recurring jobs that run Claude and can message you back
 - **Web access** — search and fetch content from the web
 - **Container isolation** — agents are sandboxed in Docker (macOS/Linux/WSL2), with optional [Docker Sandboxes](docs/docker-sandboxes.md) micro-VM isolation or Apple Container as a macOS-native opt-in
-- **Credential security** — agents never hold raw API keys. Outbound requests route through [OneCLI's Agent Vault](https://github.com/onecli/onecli), which injects credentials at request time and enforces per-agent policies and rate limits.
+- **Credential security** — agents never hold raw API keys. Outbound requests route through [OneCLI's Agent Vault](https://github.com/onecli/onecli), which injects credentials at request time and enforces per-agent policies and rate limits. For the Vertex backend, the built-in credential proxy injects GCP tokens host-side instead (OneCLI doesn't support Vertex).
+- **Gemini via Vertex AI** *(this fork)* — run agents on Google Gemini through a GCP project, with GCP credentials kept entirely host-side. See [Vertex AI (Gemini) Backend](#vertex-ai-gemini-backend).
 
 ## Usage
 
@@ -133,6 +210,7 @@ Skills we'd like to see:
 - Node.js 20+ and pnpm 10+ (the installer will install both if missing)
 - [Docker Desktop](https://docker.com/products/docker-desktop) (macOS/Windows) or Docker Engine (Linux)
 - [Claude Code](https://claude.ai/download) for `/customize`, `/debug`, error recovery during setup, and all `/add-<channel>` skills
+- *For the Vertex backend (this fork):* a GCP project with the Vertex AI API enabled, Gemini access, and an IAM principal with `roles/aiplatform.user`. See [Vertex AI (Gemini) Backend](#vertex-ai-gemini-backend).
 
 ## Architecture
 
@@ -180,6 +258,8 @@ We don't want configuration sprawl. Every user should customize NanoClaw so that
 **Can I use third-party or open-source models?**
 
 Yes. The supported path is `/add-opencode` (OpenRouter, OpenAI, Google, DeepSeek, and more via OpenCode config) or `/add-ollama-provider` (local open-weight models via Ollama). Both are configurable per agent group, so different agents can run on different backends in the same install.
+
+This fork additionally wires `/add-opencode` to **Google Gemini via Vertex AI** with host-side GCP credential injection — see [Vertex AI (Gemini) Backend](#vertex-ai-gemini-backend).
 
 For one-off experiments, any Claude API-compatible endpoint also works via `.env`:
 
