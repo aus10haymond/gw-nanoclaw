@@ -2,10 +2,16 @@
  * ncl — chat with your NanoClaw agent from the terminal.
  *
  * Usage:
- *   pnpm run chat <message...>
+ *   pnpm run chat <message...>          # message from argv
+ *   echo "<message>" | pnpm run chat    # message from stdin (no argv)
  *
  * Sends the message through the CLI channel (Unix socket) to the wired agent.
- * Reads replies until the stream goes quiet, then exits.
+ * Reads replies until the stream goes quiet, then exits. The stdin form lets a
+ * programmatic caller (e.g. the deltawave codegen pipeline) pass a long,
+ * multi-line prompt without argv length / shell-escaping limits.
+ *
+ * The hard "no reply" timeout defaults to 120s; override with
+ * NANOCLAW_CHAT_TIMEOUT_MS (callers driving long agentic work raise this).
  *
  * Preconditions: NanoClaw host service running, an agent group wired to
  * `cli/local` via `/init-first-agent` or `/manage-channels`.
@@ -16,20 +22,34 @@ import path from 'path';
 import { DATA_DIR } from '../src/config.js';
 
 const SILENCE_MS = 2000; // exit after this much quiet time following the first reply
-const TOTAL_TIMEOUT_MS = 120_000; // hard stop
+const TOTAL_TIMEOUT_MS = Number(process.env.NANOCLAW_CHAT_TIMEOUT_MS) || 120_000; // hard stop
 
 function socketPath(): string {
   return path.join(DATA_DIR, 'cli.sock');
 }
 
-function main(): void {
-  const words = process.argv.slice(2);
-  if (words.length === 0) {
-    console.error('usage: pnpm run chat <message...>');
-    process.exit(1);
-  }
-  const text = words.join(' ');
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (c) => (data += c));
+    process.stdin.on('end', () => resolve(data));
+  });
+}
 
+async function resolveText(): Promise<string> {
+  const fromArgv = process.argv.slice(2).join(' ').trim();
+  if (fromArgv) return fromArgv;
+  // No argv message: read it from stdin (programmatic / piped callers).
+  if (!process.stdin.isTTY) {
+    const fromStdin = (await readStdin()).trim();
+    if (fromStdin) return fromStdin;
+  }
+  console.error('usage: pnpm run chat <message...>   (or pipe the message on stdin)');
+  process.exit(1);
+}
+
+function main(text: string): void {
   const socket = net.connect(socketPath());
 
   socket.on('error', (err) => {
@@ -98,4 +118,4 @@ function main(): void {
   });
 }
 
-main();
+resolveText().then(main);
