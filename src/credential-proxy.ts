@@ -132,9 +132,7 @@ function pruneSchemaForGemini(schema: unknown): void {
 // forget — failures log a warning but never affect the proxy response, which
 // is already flowing back to the container by the time we look at usage.
 
-const USAGE_LOG_PATH = resolvePath(
-  process.env.PROXY_USAGE_LOG || './data/proxy-usage.jsonl',
-);
+const USAGE_LOG_PATH = resolvePath(process.env.PROXY_USAGE_LOG || './data/proxy-usage.jsonl');
 
 interface UsageRecord {
   ts: string;
