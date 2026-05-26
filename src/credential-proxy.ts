@@ -22,6 +22,9 @@
 import { createServer, Server } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
+import { appendFile } from 'fs/promises';
+import { resolve as resolvePath } from 'path';
+import { gunzipSync, inflateSync, brotliDecompressSync } from 'zlib';
 
 import { readEnvFile } from './env.js';
 import { log } from './log.js';
@@ -118,6 +121,102 @@ function pruneSchemaForGemini(schema: unknown): void {
   if (Array.isArray(obj.required) && props && typeof props === 'object') {
     const known = new Set(Object.keys(props as Record<string, unknown>));
     obj.required = (obj.required as unknown[]).filter((r) => typeof r === 'string' && known.has(r));
+  }
+}
+
+// ── Usage capture ────────────────────────────────────────────────────────────
+// Observe Vertex chat/completions responses, extract { usage: {...} }, and
+// append a JSONL record to PROXY_USAGE_LOG (default ./data/proxy-usage.jsonl).
+// The deltawave pipeline reads these records (filtered by timestamp window)
+// to attribute tokens + cost to a specific codegen run. Capture is fire-and-
+// forget — failures log a warning but never affect the proxy response, which
+// is already flowing back to the container by the time we look at usage.
+
+const USAGE_LOG_PATH = resolvePath(
+  process.env.PROXY_USAGE_LOG || './data/proxy-usage.jsonl',
+);
+
+interface UsageRecord {
+  ts: string;
+  url: string;
+  model: string | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+function extractUsage(
+  body: Buffer,
+): { usage: { prompt_tokens?: number; completion_tokens?: number }; model: string | null } | null {
+  const text = body.toString('utf8');
+  if (!text) return null;
+  // SSE streaming: usage rides in the last data: chunk before [DONE] when the
+  // request set stream_options.include_usage. Scan backwards for the last
+  // parseable JSON event carrying usage.
+  if (text.includes('\ndata:') || text.startsWith('data:')) {
+    const lines = text.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+      try {
+        const obj = JSON.parse(payload) as {
+          usage?: { prompt_tokens?: number; completion_tokens?: number };
+          model?: string;
+        };
+        if (obj.usage) return { usage: obj.usage, model: obj.model ?? null };
+      } catch {
+        /* skip malformed events */
+      }
+    }
+    return null;
+  }
+  // Non-streaming JSON body.
+  try {
+    const obj = JSON.parse(text) as {
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
+      model?: string;
+    };
+    if (obj.usage) return { usage: obj.usage, model: obj.model ?? null };
+  } catch {
+    /* not JSON — error pages, non-OpenAI shapes, etc. */
+  }
+  return null;
+}
+
+function decompressIfNeeded(body: Buffer, contentEncoding?: string): Buffer {
+  // Vertex AI returns gzipped responses by default for chat/completions; the
+  // container's AI SDK accepts them transparently, but our observer sees the
+  // raw bytes. Decompress so extractUsage can parse the JSON/SSE plaintext.
+  const enc = (contentEncoding || '').toLowerCase().trim();
+  if (!enc || enc === 'identity') return body;
+  try {
+    if (enc === 'gzip') return gunzipSync(body);
+    if (enc === 'deflate') return inflateSync(body);
+    if (enc === 'br') return brotliDecompressSync(body);
+  } catch (err) {
+    log.warn('Usage capture: decompression failed', { err, encoding: enc });
+    return Buffer.alloc(0);
+  }
+  return body;
+}
+
+async function captureUsage(body: Buffer, url: string, contentEncoding?: string): Promise<void> {
+  if (!url.includes('/chat/completions')) return;
+  const decoded = decompressIfNeeded(body, contentEncoding);
+  const extracted = extractUsage(decoded);
+  if (!extracted) return;
+  const rec: UsageRecord = {
+    ts: new Date().toISOString(),
+    url,
+    model: extracted.model,
+    prompt_tokens: extracted.usage.prompt_tokens ?? 0,
+    completion_tokens: extracted.usage.completion_tokens ?? 0,
+  };
+  try {
+    await appendFile(USAGE_LOG_PATH, JSON.stringify(rec) + '\n', 'utf8');
+  } catch (err) {
+    log.warn('Failed to write proxy-usage log', { err, path: USAGE_LOG_PATH });
   }
 }
 
@@ -241,6 +340,16 @@ export function startCredentialProxy(port: number, host = '127.0.0.1'): Promise<
           } as RequestOptions,
           (upRes) => {
             res.writeHead(upRes.statusCode!, upRes.headers);
+            // Tee the response: pipe straight to the container AND accumulate
+            // chunks so we can extract usage after end. Listeners are attached
+            // before pipe() so no chunks are missed when flowing mode starts.
+            const respChunks: Buffer[] = [];
+            const reqUrl = req.url || '';
+            upRes.on('data', (chunk: Buffer) => respChunks.push(chunk));
+            const upContentEncoding = upRes.headers['content-encoding'] as string | undefined;
+            upRes.on('end', () => {
+              void captureUsage(Buffer.concat(respChunks), reqUrl, upContentEncoding);
+            });
             upRes.pipe(res);
           },
         );
