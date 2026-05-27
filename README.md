@@ -67,12 +67,44 @@ The agent runtime (Claude Code) only speaks the Anthropic API, so Gemini runs th
 - A GCP project with the **Vertex AI API enabled** and access to Gemini models (an IAM principal with **`roles/aiplatform.user`**).
 - Docker, Node 20+/pnpm 10+ (standard nanoclaw requirements).
 
+**Host bootstrap (Linux / WSL2)** — if starting from a fresh box:
+
+```bash
+# Required tools
+sudo apt update
+sudo apt install -y python3 git docker.io
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+sudo apt install -y nodejs
+sudo npm install -g pnpm
+
+# Allow systemd --user services to survive logout (required by the systemd unit below)
+sudo loginctl enable-linger "$USER"
+
+# Let the install user talk to the Docker daemon without sudo
+sudo usermod -aG docker "$USER"
+# log out and back in so the docker group membership takes effect
+```
+
 ### Setup
 
 **1. Authenticate with Application Default Credentials (ADC).** The proxy reads ADC host-side; credentials are never exported into the shell or the container.
 
 - *Local / dev:* `gcloud auth application-default login` — writes `~/.config/gcloud/application_default_credentials.json`. Uses your personal identity; fine for testing.
-- *Internal / production (recommended):* create a service account with `roles/aiplatform.user`, download a JSON key **outside the repo** (`chmod 600`), and point `GOOGLE_APPLICATION_CREDENTIALS` at it in `.env` (below). Pipeline-scoped, non-personal, portable to bare-metal hosts.
+- *Internal / production (recommended):* create a scoped service account, download a JSON key **outside the repo** (`chmod 600`), and point `GOOGLE_APPLICATION_CREDENTIALS` at it in `.env` (below). Pipeline-scoped, non-personal, portable to bare-metal hosts. Full one-time commands (substitute your project ID for `gw-pbctl`):
+
+  ```bash
+  gcloud iam service-accounts create gw-nanoclaw-vertex \
+    --project=gw-pbctl --display-name="GW NanoClaw Vertex"
+
+  gcloud projects add-iam-policy-binding gw-pbctl \
+    --member="serviceAccount:gw-nanoclaw-vertex@gw-pbctl.iam.gserviceaccount.com" \
+    --role="roles/aiplatform.user"
+
+  mkdir -p ~/.config/nanoclaw
+  gcloud iam service-accounts keys create ~/.config/nanoclaw/vertex-sa.json \
+    --iam-account=gw-nanoclaw-vertex@gw-pbctl.iam.gserviceaccount.com
+  chmod 600 ~/.config/nanoclaw/vertex-sa.json
+  ```
 
 > **Credential isolation:** keep all GCP env vars in `nanoclaw-v2/.env` (read explicitly via `readEnvFile`, never loaded into `process.env`). Never put them in your shell profile — a Claude Code session authenticated with a Max subscription must not inherit pipeline GCP credentials.
 
@@ -117,10 +149,25 @@ ncl groups config update --id <agent-group-id> --provider opencode
 **6. Restart and test:**
 
 ```bash
-systemctl --user restart nanoclaw-v2-<install-id>      # Linux/WSL2
+systemctl --user restart nanoclaw-v2-<install-id>      # Linux/WSL2 (standalone nanoclaw)
+# Or, when installed as part of the Gentle Weapons pipeline via gw-install.sh:
+systemctl --user restart gw-nanoclaw
+systemctl --user status gw-nanoclaw
+
 pnpm run chat "what model and provider are you running on?"
 # -> "I am running on the google/gemini-2.5-flash model, provided by Vertex AI."
 ```
+
+### Gentle Weapons full-pipeline install (alternative to manual setup)
+
+If you are deploying this fork as part of the Gentle Weapons SDLC pipeline (deltawave + nanoclaw + a target repo), use the bundled installer instead of running the manual steps above — it handles repo clone, `.env` generation, the agent-image build, systemd-user unit creation, and (optionally) a Cloudflare quick-tunnel for the Linear webhook:
+
+```bash
+git clone git@github.com:aus10haymond/deltawave.git
+./deltawave/install/gw-install.sh
+```
+
+The installer prompts for the Linear API key, target repo, and optional webhook signing secret, then starts `gw-nanoclaw`, `gw-deltawave-intake`, and (if a webhook secret was provided) `gw-cloudflared` as systemd-user services. Verify with `gw status` and tail logs with `gw logs`. See `deltawave/docs/RUNBOOK.md` for full operator commands.
 
 ### How it works
 
